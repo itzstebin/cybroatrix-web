@@ -1,0 +1,30 @@
+rules_version = '2';
+
+// Cybroatrix — Firebase Storage security rules
+//
+// Layout: avatars/{uid}/avatar.{ext} — one profile picture per user, fixed
+// filename per extension (see src/lib/storage.ts, which sweeps all known
+// extensions on every upload so switching file types never orphans a file).
+//
+// Mirrors the client-side validation in uploadAvatar()/validateAvatarFile()
+// — enforced here too since the client can't be trusted to self-police.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /avatars/{uid}/{fileName} {
+      // Avatars are shown on public profile pages, so anyone can read them.
+      allow read: if true;
+
+      allow write: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.size <= 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp|gif)');
+
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

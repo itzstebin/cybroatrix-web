@@ -1,0 +1,105 @@
+rules_version = '2';
+
+// Cybroatrix — Firestore security rules
+//
+// Collections:
+//   users/{uid}        — one profile document per authenticated user
+//   usernames/{name}   — uniqueness lock; doc ID IS the lowercase username,
+//                         { uid, createdAt }. Existence of this doc is what
+//                         makes a username "taken" — see lib/profile.ts for
+//                         the client-side transaction that keeps this in
+//                         sync with users/{uid}.username.
+//
+// These rules are the actual enforcement layer — the app's client-side
+// validation (src/lib/username.ts, the availability-check transaction in
+// src/lib/profile.ts) exists for UX, not security. Everything here has to
+// hold even if a client sent arbitrary requests directly against the API.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isValidUsername(username) {
+      return username is string
+        && username.size() >= 3
+        && username.size() <= 20
+        && username.matches('^[a-z0-9_-]+$');
+    }
+
+    function ownsUsername(username, uid) {
+      return exists(/databases/$(database)/documents/usernames/$(username))
+        && get(/databases/$(database)/documents/usernames/$(username)).data.uid == uid;
+    }
+
+    // ---- users/{uid} : profile documents ----
+    match /users/{uid} {
+      // Public profiles are readable by anyone; private profiles are
+      // readable only by their owner. This is what makes a private
+      // profile actually private, not just hidden in the UI — PublicProfile
+      // treats the resulting permission-denied as the "private" state.
+      allow read: if resource.data.profileVisibility == 'public' || isOwner(uid);
+
+      allow create: if isOwner(uid)
+        && request.resource.data.uid == uid
+        && isValidUsername(request.resource.data.username)
+        && request.resource.data.profileVisibility in ['public', 'private']
+        // The username doc must already be claimed by this uid — in
+        // practice this write always happens alongside the usernames/
+        // create in the same client transaction (see createUserProfile),
+        // and get() here sees that transaction's own pending write.
+        && ownsUsername(request.resource.data.username, uid);
+
+      allow update: if isOwner(uid)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.profileVisibility in ['public', 'private']
+        && request.resource.data.bio is string && request.resource.data.bio.size() <= 500
+        // Username may only change to a value this uid has actually
+        // claimed in usernames/ (again, the same-transaction case from
+        // changeUsername) — never to an arbitrary string.
+        && (
+          request.resource.data.username == resource.data.username
+          || (isValidUsername(request.resource.data.username) && ownsUsername(request.resource.data.username, uid))
+        );
+
+      allow delete: if isOwner(uid);
+    }
+
+    // ---- usernames/{username} : uniqueness locks ----
+    match /usernames/{username} {
+      // Public so logged-out visitors can resolve /:username profile URLs,
+      // and so live availability checks work before someone has an account.
+      // The document itself holds nothing sensitive (uid + a timestamp).
+      allow read: if true;
+
+      // Firestore only evaluates this as a "create" when no document
+      // currently exists at this path — so this rule, combined with
+      // "update" always being denied below, is what actually guarantees
+      // uniqueness: only one uid can ever win the create for a given name.
+      allow create: if isSignedIn()
+        && isValidUsername(username)
+        && request.resource.data.uid == request.auth.uid;
+
+      // A username is claimed or released, never edited in place.
+      allow update: if false;
+
+      // Only the current holder can release their own username (used by
+      // changeUsername and account deletion).
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // Explicit default-deny for everything else. Firestore already denies
+    // by default when no rule matches, but this makes that posture explicit
+    // and auditable rather than implicit.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
